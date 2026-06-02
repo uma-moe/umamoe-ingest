@@ -8,7 +8,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential ca-certificates pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 
 RUN cargo build --release --locked
 
