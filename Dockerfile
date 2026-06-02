@@ -10,8 +10,7 @@ RUN apt-get update \
 
 COPY . .
 
-RUN mkdir -p migrations \
-    && cargo build --release --locked
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
 

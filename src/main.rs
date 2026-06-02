@@ -39,14 +39,6 @@ async fn main() {
 
     info!("Connected to database");
 
-    sqlx::migrate!("./migrations")
-        .set_ignore_missing(true)
-        .run(&db)
-        .await
-        .expect("Failed to run migrations");
-
-    info!("Migrations applied");
-
     let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     auth::init(jwt_secret);
     info!("JWT authentication configured");
