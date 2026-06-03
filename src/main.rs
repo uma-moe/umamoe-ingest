@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use axum::{extract::DefaultBodyLimit, routing::get, Json, Router};
+use axum::{extract::DefaultBodyLimit, middleware, routing::get, Json, Router};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -14,6 +14,7 @@ mod models;
 #[derive(Clone)]
 pub struct AppState {
     pub db: sqlx::PgPool,
+    pub auth_backend: auth::AuthBackend,
 }
 
 #[tokio::main]
@@ -39,18 +40,27 @@ async fn main() {
 
     info!("Connected to database");
 
-    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
-    auth::init(jwt_secret);
-    info!("JWT authentication configured");
+    let auth_backend = auth::AuthBackend::from_env();
+    info!("Centralized backend authentication configured");
 
-    let state = AppState { db };
+    let state = AppState { db, auth_backend };
 
     // 128 MB cap — generous headroom for large veteran lists
     const BODY_LIMIT: usize = 128 * 1024 * 1024;
 
+    let protected_routes = Router::new()
+        .route(
+            "/ingest/veteran",
+            axum::routing::post(handlers::ingest::veteran_list),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
     let app = Router::new()
         .route("/health", get(health))
-        .route("/ingest/veteran", axum::routing::post(handlers::ingest::veteran_list))
+        .merge(protected_routes)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
