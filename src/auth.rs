@@ -116,6 +116,8 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
 struct VerifyInternalResponse {
     valid: bool,
     credential: Option<String>,
+    message: Option<String>,
+    error: Option<String>,
     user_id: Option<Uuid>,
     sub: Option<Uuid>,
     api_key: Option<ApiKeyVerify>,
@@ -189,15 +191,40 @@ async fn authorize_request(
     headers: &HeaderMap,
 ) -> AuthDecision {
     let context = build_context(method, uri, headers);
+    log_auth_request(&context, headers);
 
     if let Some(bearer_token) = auth_common::extract_bearer_token(headers) {
+        tracing::info!(
+            method = %context.method,
+            path = %context.path,
+            host = context.host.as_deref().unwrap_or("<none>"),
+            token_len = bearer_token.len(),
+            "Verifying ingest request with bearer token"
+        );
         return match backend.verify_bearer_token(context, bearer_token).await {
             Ok(response) if response.valid && response.credential.as_deref() == Some("bearer") => {
-                AuthDecision::Allow(AuthContext {
-                    user_id: response.user_id(),
-                })
+                let user_id = response.user_id();
+                if user_id.is_none() {
+                    tracing::warn!(
+                        credential = response.credential.as_deref().unwrap_or("<none>"),
+                        message = response.message.as_deref().unwrap_or("<none>"),
+                        error = response.error.as_deref().unwrap_or("<none>"),
+                        "Backend accepted bearer token without user_id"
+                    );
+                }
+                AuthDecision::Allow(AuthContext { user_id })
             }
-            Ok(_) => AuthDecision::Reject(AuthRejection::unauthorized("Invalid bearer token")),
+            Ok(response) => {
+                tracing::warn!(
+                    valid = response.valid,
+                    credential = response.credential.as_deref().unwrap_or("<none>"),
+                    message = response.message.as_deref().unwrap_or("<none>"),
+                    error = response.error.as_deref().unwrap_or("<none>"),
+                    has_user_id = response.user_id().is_some(),
+                    "Backend rejected bearer token for ingest request"
+                );
+                AuthDecision::Reject(AuthRejection::unauthorized("Invalid bearer token"))
+            }
             Err(err) => {
                 tracing::error!("Backend bearer token verification failed: {err:?}");
                 AuthDecision::Reject(AuthRejection::bad_gateway(
@@ -212,6 +239,14 @@ async fn authorize_request(
             Credential::ApiCredential { header_name, value } => (header_name, value.to_owned()),
             Credential::BrowserProof(_) => unreachable!("API extractor cannot return proof"),
         };
+        tracing::info!(
+            method = %context.method,
+            path = %context.path,
+            host = context.host.as_deref().unwrap_or("<none>"),
+            header_name,
+            token_len = value.len(),
+            "Verifying ingest request with API credential"
+        );
         return match backend
             .verify_api_credential(context, header_name, value)
             .await
@@ -219,7 +254,17 @@ async fn authorize_request(
             Ok(response) if response.valid => AuthDecision::Allow(AuthContext {
                 user_id: response.user_id(),
             }),
-            Ok(_) => AuthDecision::Reject(AuthRejection::unauthorized("Invalid API credential")),
+            Ok(response) => {
+                tracing::warn!(
+                    valid = response.valid,
+                    credential = response.credential.as_deref().unwrap_or("<none>"),
+                    message = response.message.as_deref().unwrap_or("<none>"),
+                    error = response.error.as_deref().unwrap_or("<none>"),
+                    has_user_id = response.user_id().is_some(),
+                    "Backend rejected API credential for ingest request"
+                );
+                AuthDecision::Reject(AuthRejection::unauthorized("Invalid API credential"))
+            }
             Err(err) => {
                 tracing::error!("Backend API credential verification failed: {err:?}");
                 AuthDecision::Reject(AuthRejection::bad_gateway(
@@ -230,6 +275,13 @@ async fn authorize_request(
     }
 
     if let Some(browser_proof) = auth_common::extract_browser_proof(headers) {
+        tracing::info!(
+            method = %context.method,
+            path = %context.path,
+            host = context.host.as_deref().unwrap_or("<none>"),
+            proof_len = browser_proof.len(),
+            "Verifying ingest request with browser proof"
+        );
         return match backend.verify_browser_proof(context, browser_proof).await {
             Ok(response)
                 if response.valid && response.credential.as_deref() == Some("browser_proof") =>
@@ -238,7 +290,17 @@ async fn authorize_request(
                     user_id: response.user_id(),
                 })
             }
-            Ok(_) => AuthDecision::Reject(AuthRejection::forbidden("Invalid browser proof")),
+            Ok(response) => {
+                tracing::warn!(
+                    valid = response.valid,
+                    credential = response.credential.as_deref().unwrap_or("<none>"),
+                    message = response.message.as_deref().unwrap_or("<none>"),
+                    error = response.error.as_deref().unwrap_or("<none>"),
+                    has_user_id = response.user_id().is_some(),
+                    "Backend rejected browser proof for ingest request"
+                );
+                AuthDecision::Reject(AuthRejection::forbidden("Invalid browser proof"))
+            }
             Err(err) => {
                 tracing::error!("Backend browser proof verification failed: {err:?}");
                 AuthDecision::Reject(AuthRejection::bad_gateway(
@@ -249,6 +311,12 @@ async fn authorize_request(
     }
 
     if method == Method::GET || method == Method::HEAD {
+        tracing::info!(
+            method = %context.method,
+            path = %context.path,
+            host = context.host.as_deref().unwrap_or("<none>"),
+            "Requesting browser proof bootstrap for safe ingest request"
+        );
         return match backend.request_browser_proof(context).await {
             Ok(headers) => AuthDecision::Bootstrap(headers),
             Err(err) => {
@@ -335,18 +403,57 @@ impl AuthBackend {
 
 async fn verify_response(response: reqwest::Response) -> anyhow::Result<VerifyInternalResponse> {
     let status = response.status();
+    let body_text = response.text().await?;
+
     if status != reqwest::StatusCode::OK {
-        return Ok(VerifyInternalResponse {
+        let parsed = serde_json::from_str::<VerifyInternalResponse>(&body_text).ok();
+        if let Some(response) = parsed {
+            tracing::warn!(
+                status = status.as_u16(),
+                valid = response.valid,
+                credential = response.credential.as_deref().unwrap_or("<none>"),
+                message = response.message.as_deref().unwrap_or("<none>"),
+                error = response.error.as_deref().unwrap_or("<none>"),
+                has_user_id = response.user_id().is_some(),
+                "Backend auth verification returned non-OK response"
+            );
+            return Ok(response);
+        }
+
+        tracing::warn!(
+            status = status.as_u16(),
+            body_preview = %body_preview(&body_text),
+            "Backend auth verification returned non-OK non-JSON response"
+        );
+        return Ok(VerifyInternalResponse::invalid());
+    }
+
+    let response = serde_json::from_str::<VerifyInternalResponse>(&body_text)?;
+    tracing::info!(
+        status = status.as_u16(),
+        valid = response.valid,
+        credential = response.credential.as_deref().unwrap_or("<none>"),
+        message = response.message.as_deref().unwrap_or("<none>"),
+        error = response.error.as_deref().unwrap_or("<none>"),
+        has_user_id = response.user_id().is_some(),
+        "Backend auth verification response"
+    );
+    Ok(response)
+}
+
+impl VerifyInternalResponse {
+    fn invalid() -> Self {
+        Self {
             valid: false,
             credential: None,
+            message: None,
+            error: None,
             user_id: None,
             sub: None,
             api_key: None,
             browser_proof: None,
-        });
+        }
     }
-
-    Ok(response.json::<VerifyInternalResponse>().await?)
 }
 
 fn build_context(method: &Method, uri: &Uri, headers: &HeaderMap) -> RequestContext {
@@ -356,6 +463,26 @@ fn build_context(method: &Method, uri: &Uri, headers: &HeaderMap) -> RequestCont
         .unwrap_or_else(|| uri.path());
 
     auth_common::request_context(headers, method, path)
+}
+
+fn log_auth_request(context: &RequestContext, headers: &HeaderMap) {
+    tracing::info!(
+        method = %context.method,
+        path = %context.path,
+        origin = context.origin.as_deref().unwrap_or("<none>"),
+        referer = context.referer.as_deref().unwrap_or("<none>"),
+        host = context.host.as_deref().unwrap_or("<none>"),
+        has_authorization = headers.contains_key(AUTHORIZATION_HEADER),
+        has_bearer = auth_common::extract_bearer_token(headers).is_some(),
+        has_api_credential = auth_common::extract_api_credential(headers).is_some(),
+        has_browser_proof = auth_common::extract_browser_proof(headers).is_some(),
+        "Ingest auth request"
+    );
+}
+
+fn body_preview(body: &str) -> String {
+    const MAX_BODY_PREVIEW_CHARS: usize = 256;
+    body.chars().take(MAX_BODY_PREVIEW_CHARS).collect()
 }
 
 #[cfg(test)]
