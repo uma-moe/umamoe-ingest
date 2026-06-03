@@ -2,26 +2,25 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::{FromRequestParts, State},
-    http::{
-        header, request::Parts, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
-        Uri,
-    },
+    http::{request::Parts, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{
+    auth_common::{
+        self, AuthRequestContext as RequestContext, BrowserProofRequest, Credential,
+        BROWSER_PROOF_HEADER,
+    },
+    AppState,
+};
 
 const DEFAULT_BACKEND_INTERNAL_BASE: &str = "http://umamoe-backend:3201";
-const X_API_KEY: &str = "X-API-Key";
-const X_API_TOKEN: &str = "X-API-Token";
-const X_BROWSER_PROOF: &str = "X-Browser-Proof";
-const BROWSER_PROOF_COOKIE: &str = "uma_browser_proof";
 
 #[derive(Debug, Clone)]
 pub struct AuthBackend {
@@ -113,38 +112,39 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct VerifyInternalRequest {
-    method: String,
-    path: String,
-    origin: String,
-    referer: String,
-    host: String,
-    record_usage: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct BrowserProofRequest {
-    origin: String,
-    referer: String,
-    host: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct VerifyInternalResponse {
     valid: bool,
     credential: Option<String>,
     user_id: Option<Uuid>,
     sub: Option<Uuid>,
+    api_key: Option<ApiKeyVerify>,
+    browser_proof: Option<BrowserProofVerify>,
 }
 
-#[derive(Debug, Clone)]
-struct RequestContext {
-    method: String,
-    path: String,
-    origin: String,
-    referer: String,
-    host: String,
+#[derive(Debug, Deserialize)]
+struct ApiKeyVerify {
+    user_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserProofVerify {
+    user_id: Option<Uuid>,
+}
+
+impl VerifyInternalResponse {
+    fn user_id(&self) -> Option<Uuid> {
+        self.api_key
+            .as_ref()
+            .map(|api_key| api_key.user_id)
+            .or_else(|| {
+                self.browser_proof
+                    .as_ref()
+                    .and_then(|browser_proof| browser_proof.user_id)
+            })
+            .or(self.user_id)
+            .or(self.sub)
+    }
 }
 
 #[derive(Debug)]
@@ -189,16 +189,18 @@ async fn authorize_request(
     headers: &HeaderMap,
 ) -> AuthDecision {
     let context = build_context(method, uri, headers);
-    let api_key = header_string(headers, X_API_KEY);
-    let api_token = header_string(headers, X_API_TOKEN);
 
-    if api_key.is_some() || api_token.is_some() {
+    if let Some(api_credential) = auth_common::extract_api_credential(headers) {
+        let (header_name, value) = match api_credential {
+            Credential::ApiCredential { header_name, value } => (header_name, value.to_owned()),
+            Credential::BrowserProof(_) => unreachable!("API extractor cannot return proof"),
+        };
         return match backend
-            .verify_api_credential(context, api_key, api_token)
+            .verify_api_credential(context, header_name, value)
             .await
         {
             Ok(response) if response.valid => AuthDecision::Allow(AuthContext {
-                user_id: response.user_id.or(response.sub),
+                user_id: response.user_id(),
             }),
             Ok(_) => AuthDecision::Reject(AuthRejection::unauthorized("Invalid API credential")),
             Err(err) => {
@@ -210,16 +212,13 @@ async fn authorize_request(
         };
     }
 
-    let browser_proof =
-        header_string(headers, X_BROWSER_PROOF).or_else(|| browser_proof_cookie(headers));
-
-    if let Some(browser_proof) = browser_proof {
+    if let Some(browser_proof) = auth_common::extract_browser_proof(headers) {
         return match backend.verify_browser_proof(context, browser_proof).await {
             Ok(response)
                 if response.valid && response.credential.as_deref() == Some("browser_proof") =>
             {
                 AuthDecision::Allow(AuthContext {
-                    user_id: response.user_id.or(response.sub),
+                    user_id: response.user_id(),
                 })
             }
             Ok(_) => AuthDecision::Reject(AuthRejection::forbidden("Invalid browser proof")),
@@ -251,27 +250,14 @@ impl AuthBackend {
     async fn verify_api_credential(
         &self,
         context: RequestContext,
-        api_key: Option<String>,
-        api_token: Option<String>,
+        header_name: &'static str,
+        value: String,
     ) -> anyhow::Result<VerifyInternalResponse> {
-        let mut request = self
+        let request = self
             .client
             .post(format!("{}/api/auth/verify/internal", self.base_url))
-            .json(&VerifyInternalRequest {
-                method: context.method,
-                path: context.path,
-                origin: context.origin,
-                referer: context.referer,
-                host: context.host,
-                record_usage: true,
-            });
-
-        if let Some(api_key) = api_key {
-            request = request.header(X_API_KEY, api_key);
-        }
-        if let Some(api_token) = api_token {
-            request = request.header(X_API_TOKEN, api_token);
-        }
+            .header(header_name, value)
+            .json(&context);
 
         verify_response(request.send().await?).await
     }
@@ -279,20 +265,13 @@ impl AuthBackend {
     async fn verify_browser_proof(
         &self,
         context: RequestContext,
-        browser_proof: String,
+        browser_proof: &str,
     ) -> anyhow::Result<VerifyInternalResponse> {
         let request = self
             .client
             .post(format!("{}/api/auth/verify/internal", self.base_url))
-            .header(X_BROWSER_PROOF, browser_proof)
-            .json(&VerifyInternalRequest {
-                method: context.method,
-                path: context.path,
-                origin: context.origin,
-                referer: context.referer,
-                host: context.host,
-                record_usage: true,
-            });
+            .header(BROWSER_PROOF_HEADER, browser_proof)
+            .json(&context);
 
         verify_response(request.send().await?).await
     }
@@ -305,15 +284,15 @@ impl AuthBackend {
             .client
             .post(format!("{}/api/auth/browser-proof/internal", self.base_url))
             .json(&BrowserProofRequest {
-                origin: context.origin,
-                referer: context.referer,
-                host: context.host,
+                origin: context.origin.as_deref(),
+                referer: context.referer.as_deref(),
+                host: context.host.as_deref(),
             })
             .send()
             .await?;
 
         let status = response.status();
-        let headers = collect_browser_proof_headers(response.headers());
+        let headers = auth_common::collect_browser_proof_headers(response.headers());
 
         if !status.is_success() {
             anyhow::bail!("browser-proof/internal returned HTTP {status}");
@@ -331,6 +310,8 @@ async fn verify_response(response: reqwest::Response) -> anyhow::Result<VerifyIn
             credential: None,
             user_id: None,
             sub: None,
+            api_key: None,
+            browser_proof: None,
         });
     }
 
@@ -338,72 +319,52 @@ async fn verify_response(response: reqwest::Response) -> anyhow::Result<VerifyIn
 }
 
 fn build_context(method: &Method, uri: &Uri, headers: &HeaderMap) -> RequestContext {
-    RequestContext {
-        method: method.as_str().to_string(),
-        path: uri
-            .path_and_query()
-            .map(|path| path.as_str().to_string())
-            .unwrap_or_else(|| uri.path().to_string()),
-        origin: header_string(headers, header::ORIGIN.as_str()).unwrap_or_default(),
-        referer: header_string(headers, header::REFERER.as_str()).unwrap_or_default(),
-        host: header_string(headers, header::HOST.as_str()).unwrap_or_default(),
+    let path = uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or_else(|| uri.path());
+
+    auth_common::request_context(headers, method, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_context;
+    use axum::http::{HeaderMap, HeaderValue, Method, Uri};
+
+    #[test]
+    fn build_context_uses_public_forwarded_host_and_tracks_api_usage() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-API-Token", HeaderValue::from_static("uma_t_test"));
+        headers.insert("X-Forwarded-Host", HeaderValue::from_static("uma.moe"));
+        headers.insert("Host", HeaderValue::from_static("umamoe-ingest"));
+
+        let context = build_context(
+            &Method::POST,
+            &Uri::from_static("/ingest/veteran?source=frontend"),
+            &headers,
+        );
+
+        assert_eq!(context.method, "POST");
+        assert_eq!(context.path, "/ingest/veteran?source=frontend");
+        assert_eq!(context.host.as_deref(), Some("uma.moe"));
+        assert_eq!(context.record_usage, Some(true));
     }
-}
 
-fn collect_browser_proof_headers(
-    headers: &reqwest::header::HeaderMap,
-) -> Vec<(HeaderName, HeaderValue)> {
-    let mut forwarded = Vec::new();
+    #[test]
+    fn build_context_omits_internal_host_without_browser_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Host", HeaderValue::from_static("umamoe-ingest"));
 
-    for value in headers.get_all(reqwest::header::SET_COOKIE).iter() {
-        if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
-            forwarded.push((header::SET_COOKIE, value));
-        }
+        let context = build_context(
+            &Method::POST,
+            &Uri::from_static("/ingest/veteran"),
+            &headers,
+        );
+
+        assert_eq!(context.origin, None);
+        assert_eq!(context.referer, None);
+        assert_eq!(context.host, None);
+        assert_eq!(context.record_usage, None);
     }
-
-    copy_header(
-        headers,
-        reqwest::header::HeaderName::from_static("x-browser-proof"),
-        HeaderName::from_static("x-browser-proof"),
-        &mut forwarded,
-    );
-    copy_header(
-        headers,
-        reqwest::header::HeaderName::from_static("x-browser-proof-ttl"),
-        HeaderName::from_static("x-browser-proof-ttl"),
-        &mut forwarded,
-    );
-
-    forwarded
-}
-
-fn copy_header(
-    source: &reqwest::header::HeaderMap,
-    source_name: reqwest::header::HeaderName,
-    target_name: HeaderName,
-    target: &mut Vec<(HeaderName, HeaderValue)>,
-) {
-    for value in source.get_all(source_name).iter() {
-        if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
-            target.push((target_name.clone(), value));
-        }
-    }
-}
-
-fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn browser_proof_cookie(headers: &HeaderMap) -> Option<String> {
-    let cookie_header = header_string(headers, header::COOKIE.as_str())?;
-
-    cookie_header.split(';').find_map(|cookie| {
-        let (name, value) = cookie.trim().split_once('=')?;
-        (name == BROWSER_PROOF_COOKIE && !value.is_empty()).then(|| value.to_string())
-    })
 }

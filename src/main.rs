@@ -7,6 +7,7 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
 mod auth;
+mod auth_common;
 mod errors;
 mod handlers;
 mod models;
