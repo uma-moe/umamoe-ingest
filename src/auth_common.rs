@@ -11,6 +11,7 @@ use serde::Serialize;
 pub const BROWSER_PROOF_COOKIE: &str = "uma_browser_proof";
 pub const BROWSER_PROOF_HEADER: &str = "X-Browser-Proof";
 pub const BROWSER_PROOF_TTL_HEADER: &str = "X-Browser-Proof-TTL";
+pub const BROWSER_PROOF_SOURCE_HEADER: &str = "X-Browser-Proof-Source";
 pub const API_KEY_HEADER: &str = "X-API-Key";
 pub const API_TOKEN_HEADER: &str = "X-API-Token";
 pub const AUTHORIZATION_HEADER: &str = "Authorization";
@@ -96,7 +97,11 @@ pub fn forward_browser_proof_headers(source: &HeaderMap, target: &mut HeaderMap)
         target.append(SET_COOKIE, value.clone());
     }
 
-    for header_name in [BROWSER_PROOF_HEADER, BROWSER_PROOF_TTL_HEADER] {
+    for header_name in [
+        BROWSER_PROOF_HEADER,
+        BROWSER_PROOF_TTL_HEADER,
+        BROWSER_PROOF_SOURCE_HEADER,
+    ] {
         for value in source.get_all(header_name).iter() {
             target.append(header_name, value.clone());
         }
@@ -124,6 +129,12 @@ pub fn collect_browser_proof_headers(
         headers,
         reqwest::header::HeaderName::from_static("x-browser-proof-ttl"),
         HeaderName::from_static("x-browser-proof-ttl"),
+        &mut forwarded,
+    );
+    copy_header(
+        headers,
+        reqwest::header::HeaderName::from_static("x-browser-proof-source"),
+        HeaderName::from_static("x-browser-proof-source"),
         &mut forwarded,
     );
 
