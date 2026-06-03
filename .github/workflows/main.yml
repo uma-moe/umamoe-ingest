@@ -23,6 +23,8 @@ env:
   BETA_CONTAINER_NAME: umamoe-ingest-beta
   PROD_ENV_FILE: /opt/umamoe-ingest/env
   BETA_ENV_FILE: /opt/umamoe-ingest-beta/env
+  PROD_AUTH_BACKEND_INTERNAL_BASE: http://umamoe-backend:3201
+  BETA_AUTH_BACKEND_INTERNAL_BASE: http://umamoe-backend-beta:3201
   APP_PORT: '3003'
   BETA_HOST_PORT: '3103'
   PROD_HOST_PORT: '3003'
@@ -156,6 +158,7 @@ jobs:
           CONTAINER_NAME: ${{ env.BETA_CONTAINER_NAME }}
           APP_PORT: ${{ env.APP_PORT }}
           ENV_FILE: ${{ env.BETA_ENV_FILE }}
+          AUTH_BACKEND_INTERNAL_BASE: ${{ env.BETA_AUTH_BACKEND_INTERNAL_BASE }}
           SHARED_NETWORK_NAME: ${{ env.SHARED_NETWORK_NAME }}
           SHARED_SERVICE_ALIAS: ${{ env.BETA_SHARED_SERVICE_ALIAS }}
         run: |
@@ -167,7 +170,7 @@ jobs:
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" "$SHARED_NETWORK_NAME" "$SHARED_SERVICE_ALIAS" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" "$AUTH_BACKEND_INTERNAL_BASE" "$SHARED_NETWORK_NAME" "$SHARED_SERVICE_ALIAS" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
@@ -176,8 +179,9 @@ jobs:
           app_port="$4"
           host_port="$5"
           env_file="$6"
-          shared_network_name="$7"
-          shared_service_alias="$8"
+          auth_backend_internal_base="$7"
+          shared_network_name="$8"
+          shared_service_alias="$9"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
@@ -197,6 +201,7 @@ jobs:
             --env-file "$env_file" \
             -e HOST=0.0.0.0 \
             -e PORT="$app_port" \
+            -e AUTH_BACKEND_INTERNAL_BASE="$auth_backend_internal_base" \
             -p "127.0.0.1:${host_port}:${app_port}" \
             "$image_tag"
 
@@ -299,6 +304,7 @@ jobs:
           CONTAINER_NAME: ${{ env.PROD_CONTAINER_NAME }}
           APP_PORT: ${{ env.APP_PORT }}
           ENV_FILE: ${{ env.PROD_ENV_FILE }}
+          AUTH_BACKEND_INTERNAL_BASE: ${{ env.PROD_AUTH_BACKEND_INTERNAL_BASE }}
           SHARED_NETWORK_NAME: ${{ env.SHARED_NETWORK_NAME }}
           SHARED_SERVICE_ALIAS: ${{ env.PROD_SHARED_SERVICE_ALIAS }}
         run: |
@@ -310,7 +316,7 @@ jobs:
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" "$SHARED_NETWORK_NAME" "$SHARED_SERVICE_ALIAS" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" "$AUTH_BACKEND_INTERNAL_BASE" "$SHARED_NETWORK_NAME" "$SHARED_SERVICE_ALIAS" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
@@ -319,8 +325,9 @@ jobs:
           app_port="$4"
           host_port="$5"
           env_file="$6"
-          shared_network_name="$7"
-          shared_service_alias="$8"
+          auth_backend_internal_base="$7"
+          shared_network_name="$8"
+          shared_service_alias="$9"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
@@ -340,6 +347,7 @@ jobs:
             --env-file "$env_file" \
             -e HOST=0.0.0.0 \
             -e PORT="$app_port" \
+            -e AUTH_BACKEND_INTERNAL_BASE="$auth_backend_internal_base" \
             -p "127.0.0.1:${host_port}:${app_port}" \
             "$image_tag"
 

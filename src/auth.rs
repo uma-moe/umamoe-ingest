@@ -31,8 +31,8 @@ pub struct AuthBackend {
 
 impl AuthBackend {
     pub fn from_env() -> Self {
-        let base_url = std::env::var("BACKEND_INTERNAL_BASE")
-            .or_else(|_| std::env::var("AUTH_BACKEND_INTERNAL_BASE"))
+        let base_url = std::env::var("AUTH_BACKEND_INTERNAL_BASE")
+            .or_else(|_| std::env::var("BACKEND_INTERNAL_BASE"))
             .unwrap_or_else(|_| DEFAULT_BACKEND_INTERNAL_BASE.to_string());
 
         Self {
