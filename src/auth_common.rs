@@ -13,6 +13,7 @@ pub const BROWSER_PROOF_HEADER: &str = "X-Browser-Proof";
 pub const BROWSER_PROOF_TTL_HEADER: &str = "X-Browser-Proof-TTL";
 pub const API_KEY_HEADER: &str = "X-API-Key";
 pub const API_TOKEN_HEADER: &str = "X-API-Token";
+pub const AUTHORIZATION_HEADER: &str = "Authorization";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthRequestContext {
@@ -75,6 +76,12 @@ pub fn extract_api_credential(headers: &HeaderMap) -> Option<Credential<'_>> {
                     value,
                 })
         })
+}
+
+pub fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = header_str(headers, header::AUTHORIZATION.as_str())?.trim();
+    let (scheme, token) = value.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("Bearer") && !token.trim().is_empty()).then_some(token.trim())
 }
 
 pub fn extract_browser_proof(headers: &HeaderMap) -> Option<&str> {

@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     auth_common::{
         self, AuthRequestContext as RequestContext, BrowserProofRequest, Credential,
-        BROWSER_PROOF_HEADER,
+        AUTHORIZATION_HEADER, BROWSER_PROOF_HEADER,
     },
     AppState,
 };
@@ -190,6 +190,23 @@ async fn authorize_request(
 ) -> AuthDecision {
     let context = build_context(method, uri, headers);
 
+    if let Some(bearer_token) = auth_common::extract_bearer_token(headers) {
+        return match backend.verify_bearer_token(context, bearer_token).await {
+            Ok(response) if response.valid && response.credential.as_deref() == Some("bearer") => {
+                AuthDecision::Allow(AuthContext {
+                    user_id: response.user_id(),
+                })
+            }
+            Ok(_) => AuthDecision::Reject(AuthRejection::unauthorized("Invalid bearer token")),
+            Err(err) => {
+                tracing::error!("Backend bearer token verification failed: {err:?}");
+                AuthDecision::Reject(AuthRejection::bad_gateway(
+                    "Authentication backend unavailable",
+                ))
+            }
+        };
+    }
+
     if let Some(api_credential) = auth_common::extract_api_credential(headers) {
         let (header_name, value) = match api_credential {
             Credential::ApiCredential { header_name, value } => (header_name, value.to_owned()),
@@ -247,6 +264,20 @@ async fn authorize_request(
 }
 
 impl AuthBackend {
+    async fn verify_bearer_token(
+        &self,
+        context: RequestContext,
+        bearer_token: &str,
+    ) -> anyhow::Result<VerifyInternalResponse> {
+        let request = self
+            .client
+            .post(format!("{}/api/auth/verify/internal", self.base_url))
+            .header(AUTHORIZATION_HEADER, format!("Bearer {bearer_token}"))
+            .json(&context);
+
+        verify_response(request.send().await?).await
+    }
+
     async fn verify_api_credential(
         &self,
         context: RequestContext,
@@ -329,8 +360,22 @@ fn build_context(method: &Method, uri: &Uri, headers: &HeaderMap) -> RequestCont
 
 #[cfg(test)]
 mod tests {
-    use super::build_context;
+    use super::{auth_common, build_context};
     use axum::http::{HeaderMap, HeaderValue, Method, Uri};
+
+    #[test]
+    fn extracts_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer user-session-token"),
+        );
+
+        assert_eq!(
+            auth_common::extract_bearer_token(&headers),
+            Some("user-session-token")
+        );
+    }
 
     #[test]
     fn build_context_uses_public_forwarded_host_and_tracks_api_usage() {
