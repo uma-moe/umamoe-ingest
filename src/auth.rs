@@ -386,6 +386,9 @@ impl AuthBackend {
                 origin: context.origin.as_deref(),
                 referer: context.referer.as_deref(),
                 host: context.host.as_deref(),
+                client_ip: context.client_ip.as_deref(),
+                user_agent: context.user_agent.as_deref(),
+                warmup_marker: context.warmup_marker.as_deref(),
             })
             .send()
             .await?;

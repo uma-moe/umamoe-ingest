@@ -9,6 +9,7 @@ use reqwest::Url;
 use serde::Serialize;
 
 pub const BROWSER_PROOF_COOKIE: &str = "uma_browser_proof";
+pub const BROWSER_WARMUP_COOKIE: &str = "uma_browser_warmup";
 pub const BROWSER_PROOF_HEADER: &str = "X-Browser-Proof";
 pub const BROWSER_PROOF_TTL_HEADER: &str = "X-Browser-Proof-TTL";
 pub const BROWSER_PROOF_SOURCE_HEADER: &str = "X-Browser-Proof-Source";
@@ -27,6 +28,12 @@ pub struct AuthRequestContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warmup_marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub record_usage: Option<bool>,
 }
 
@@ -38,6 +45,12 @@ pub struct BrowserProofRequest<'a> {
     pub referer: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warmup_marker: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -56,6 +69,9 @@ pub fn request_context(headers: &HeaderMap, method: &Method, path: &str) -> Auth
         origin: header_str(headers, header::ORIGIN.as_str()).map(ToOwned::to_owned),
         referer: header_str(headers, header::REFERER.as_str()).map(ToOwned::to_owned),
         host: browser_context_host(headers),
+        client_ip: client_ip(headers).map(ToOwned::to_owned),
+        user_agent: header_str(headers, header::USER_AGENT.as_str()).map(ToOwned::to_owned),
+        warmup_marker: cookie_value(headers, BROWSER_WARMUP_COOKIE).map(ToOwned::to_owned),
         record_usage: extract_api_credential(headers).map(|_| true),
     }
 }
@@ -212,6 +228,29 @@ fn is_internal_service_host(host: &str) -> bool {
 
 pub fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn client_ip(headers: &HeaderMap) -> Option<&str> {
+    header_str(headers, "CF-Connecting-IP")
+        .or_else(|| {
+            header_str(headers, "X-Forwarded-For")
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| header_str(headers, "X-Real-IP"))
+        .or_else(|| forwarded_for(headers))
+}
+
+fn forwarded_for(headers: &HeaderMap) -> Option<&str> {
+    let forwarded = header_str(headers, "Forwarded")?;
+    forwarded.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case("for")
+            .then_some(value.trim().trim_matches('"'))
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
