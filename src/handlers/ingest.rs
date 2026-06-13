@@ -5,14 +5,16 @@ use axum::{
     extract::{Query, State},
     Json,
 };
-use chrono::{NaiveDateTime, TimeZone, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedUser,
     errors::{AppError, Result},
-    models::{has_changed, IngestResponse, VeteranCharacter, VeteranCharacterRow, VeteranListParams},
+    models::{
+        has_changed, parse_game_time, IngestResponse, VeteranCharacter, VeteranCharacterRow,
+        VeteranListParams,
+    },
     AppState,
 };
 
@@ -27,7 +29,9 @@ pub async fn veteran_list(
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
     if characters.is_empty() {
-        return Err(AppError::BadRequest("Veteran list must not be empty".into()));
+        return Err(AppError::BadRequest(
+            "Veteran list must not be empty".into(),
+        ));
     }
 
     // Guard: maximum 512 veterans per account
@@ -54,34 +58,47 @@ pub async fn veteran_list(
     }
 
     // --- 2. Resolve account_id from user ---
-    let account_id =
-        resolve_account_id(&state.db, authenticated.user_id, params.account_id.as_deref())
-            .await?;
+    let account_id = resolve_account_id(
+        &state.db,
+        authenticated.user_id,
+        params.account_id.as_deref(),
+    )
+    .await?;
 
-    // --- 3. Load existing rows for change detection ---
+    // --- 3. Serialize and load existing rows for change detection ---
+    let mut tx = state.db.begin().await?;
+    lock_account_ingest(&mut tx, &account_id).await?;
+
     let existing_rows = sqlx::query_as::<_, VeteranCharacterRow>(
         r#"
         SELECT
-            trained_chara_id, speed, stamina, power, wiz, guts, fans,
+            trained_chara_id,
+            card_id, scenario_id, route_id, rarity,
+            succession_trained_chara_id_1, succession_trained_chara_id_2, succession_num,
+            speed, stamina, power, wiz, guts, fans,
             rank_score, rank, chara_grade, talent_level, running_style,
+            race_cloth_id, nickname_id, wins,
             proper_ground_turf, proper_ground_dirt,
             proper_running_style_nige, proper_running_style_senko,
             proper_running_style_sashi, proper_running_style_oikomi,
             proper_distance_short, proper_distance_mile,
             proper_distance_middle, proper_distance_long,
             skill_array, support_card_list, factor_info_array, win_saddle_id_array,
-            succession_chara_array
+            succession_chara_array,
+            register_time, create_time
         FROM veteran_characters
         WHERE account_id = $1
         "#,
     )
     .bind(&account_id)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await?;
 
     // --- 4. Compute diff ---
-    let existing_map: HashMap<i64, VeteranCharacterRow> =
-        existing_rows.into_iter().map(|r| (r.trained_chara_id, r)).collect();
+    let existing_map: HashMap<i64, VeteranCharacterRow> = existing_rows
+        .into_iter()
+        .map(|r| (r.trained_chara_id, r))
+        .collect();
 
     let uploaded_ids: HashSet<i64> = characters.iter().map(|c| c.trained_chara_id).collect();
     let existing_ids: HashSet<i64> = existing_map.keys().copied().collect();
@@ -105,8 +122,10 @@ pub async fn veteran_list(
     let deleted = to_delete.len() as i64;
     let updated = to_update.len() as i64;
 
-    // Nothing to do — return early without a transaction
+    // Nothing to do - commit the transaction to release the advisory lock.
     if inserted == 0 && deleted == 0 && updated == 0 {
+        tx.commit().await?;
+
         return Ok(Json(IngestResponse {
             inserted: 0,
             updated: 0,
@@ -115,9 +134,7 @@ pub async fn veteran_list(
         }));
     }
 
-    // --- 5. Apply diff inside a transaction ---
-    let mut tx = state.db.begin().await?;
-
+    // --- 5. Apply diff inside the same transaction ---
     for chara in &to_insert {
         insert_character(&mut tx, &account_id, chara).await?;
     }
@@ -139,18 +156,32 @@ pub async fn veteran_list(
     tx.commit().await?;
 
     let total = (existing_ids.len() as i64) + inserted - deleted;
-    Ok(Json(IngestResponse { inserted, updated, deleted, total }))
+    Ok(Json(IngestResponse {
+        inserted,
+        updated,
+        deleted,
+        total,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Helper: serialize ingest writes per account
+// ---------------------------------------------------------------------------
+
+async fn lock_account_ingest(tx: &mut Transaction<'_, Postgres>, account_id: &str) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(account_id)
+        .fetch_one(&mut **tx)
+        .await?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Helper: resolve account_id from user_id + optional query param
 // ---------------------------------------------------------------------------
 
-async fn resolve_account_id(
-    db: &PgPool,
-    user_id: Uuid,
-    requested: Option<&str>,
-) -> Result<String> {
+async fn resolve_account_id(db: &PgPool, user_id: Uuid, requested: Option<&str>) -> Result<String> {
     let verified: Vec<String> = sqlx::query_scalar(
         "SELECT account_id FROM linked_accounts WHERE user_id = $1 AND verification_status = 'verified'",
     )
@@ -181,16 +212,6 @@ async fn resolve_account_id(
         "Multiple verified accounts found. Specify ?account_id= with one of: {}",
         verified.join(", ")
     )))
-}
-
-// ---------------------------------------------------------------------------
-// Helper: parse game timestamp string → chrono DateTime<Utc>
-// ---------------------------------------------------------------------------
-
-fn parse_game_time(s: &str) -> Option<chrono::DateTime<Utc>> {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-        .ok()
-        .map(|ndt| Utc.from_utc_datetime(&ndt))
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +307,7 @@ async fn insert_character(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: UPDATE changed fields on an existing character row
+// Helper: UPDATE all uploaded fields on an existing character row
 // ---------------------------------------------------------------------------
 
 async fn update_character(
@@ -295,27 +316,42 @@ async fn update_character(
     c: &VeteranCharacter,
 ) -> Result<()> {
     let empty = serde_json::Value::Array(vec![]);
+    let register_time = c.register_time.as_deref().and_then(parse_game_time);
+    let create_time = c.create_time.as_deref().and_then(parse_game_time);
 
     sqlx::query(
         r#"
         UPDATE veteran_characters SET
-            speed = $3,  stamina = $4,  power = $5,  wiz = $6,  guts = $7,
-            fans = $8,   rank_score = $9, rank = $10,
-            chara_grade = $11, talent_level = $12, running_style = $13,
-            proper_ground_turf = $14,  proper_ground_dirt = $15,
-            proper_running_style_nige = $16,  proper_running_style_senko = $17,
-            proper_running_style_sashi = $18, proper_running_style_oikomi = $19,
-            proper_distance_short = $20, proper_distance_mile = $21,
-            proper_distance_middle = $22, proper_distance_long = $23,
-            skill_array = $24, support_card_list = $25,
-            factor_info_array = $26, win_saddle_id_array = $27,
-            succession_chara_array = $28,
+            card_id = $3, scenario_id = $4, route_id = $5, rarity = $6,
+            succession_trained_chara_id_1 = $7,
+            succession_trained_chara_id_2 = $8,
+            succession_num = $9,
+            speed = $10, stamina = $11, power = $12, wiz = $13, guts = $14,
+            fans = $15, rank_score = $16, rank = $17,
+            chara_grade = $18, talent_level = $19, running_style = $20,
+            race_cloth_id = $21, nickname_id = $22, wins = $23,
+            proper_ground_turf = $24, proper_ground_dirt = $25,
+            proper_running_style_nige = $26, proper_running_style_senko = $27,
+            proper_running_style_sashi = $28, proper_running_style_oikomi = $29,
+            proper_distance_short = $30, proper_distance_mile = $31,
+            proper_distance_middle = $32, proper_distance_long = $33,
+            skill_array = $34, support_card_list = $35,
+            factor_info_array = $36, win_saddle_id_array = $37,
+            succession_chara_array = $38,
+            register_time = $39, create_time = $40,
             updated_at = NOW()
         WHERE account_id = $1 AND trained_chara_id = $2
         "#,
     )
     .bind(account_id)
     .bind(c.trained_chara_id)
+    .bind(c.card_id)
+    .bind(c.scenario_id)
+    .bind(c.route_id)
+    .bind(c.rarity)
+    .bind(c.succession_trained_chara_id_1)
+    .bind(c.succession_trained_chara_id_2)
+    .bind(c.succession_num)
     .bind(c.speed)
     .bind(c.stamina)
     .bind(c.power)
@@ -327,6 +363,9 @@ async fn update_character(
     .bind(c.chara_grade)
     .bind(c.talent_level)
     .bind(c.running_style)
+    .bind(c.race_cloth_id)
+    .bind(c.nickname_id)
+    .bind(c.wins)
     .bind(c.proper_ground_turf)
     .bind(c.proper_ground_dirt)
     .bind(c.proper_running_style_nige)
@@ -342,6 +381,8 @@ async fn update_character(
     .bind(c.factor_info_array.as_ref().unwrap_or(&empty))
     .bind(c.win_saddle_id_array.as_ref().unwrap_or(&empty))
     .bind(c.succession_chara_array.as_ref().unwrap_or(&empty))
+    .bind(register_time)
+    .bind(create_time)
     .execute(&mut **tx)
     .await?;
 
